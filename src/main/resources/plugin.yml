@@ -1,0 +1,7 @@
+name: the-war-of-ceasefire
+version: ${project.version}
+main: com.mczju.ceasefire.CeasefireWar
+api-version: "26.2"
+author: AniloA
+description: The War of Ceasefire - 资源收集团队对抗小游戏(基于 MCZJUGameCore)
+depend: [ MCZJUGameCore ]
