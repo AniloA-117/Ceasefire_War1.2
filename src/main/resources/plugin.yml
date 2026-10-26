@@ -5,3 +5,7 @@ api-version: "26.2"
 author: AniloA
 description: The War of Ceasefire - 资源收集团队对抗小游戏(基于 MCZJUGameCore)
 depend: [ MCZJUGameCore ]
+permissions:
+  ceasefire.team:
+    description: "允许使用 /ceasefire team 选择队伍"
+    default: true

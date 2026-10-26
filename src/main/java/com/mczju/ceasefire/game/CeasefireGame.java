@@ -6,6 +6,8 @@ import com.github.mczjuops.mczjugamecore.game.GameMeta;
 import com.github.mczjuops.mczjugamecore.game.GameState;
 import com.github.mczjuops.mczjugamecore.game.strategy.wait.GameWaitStrategy;
 import com.github.mczjuops.mczjugamecore.player.PlayerExt;
+import com.github.mczjuops.mczjugamecore.player.party.DisbandResult;
+import com.github.mczjuops.mczjugamecore.player.party.Party;
 import com.github.mczjuops.mczjugamecore.player.strategy.AbstractPlayerDeathStrategy;
 import com.github.mczjuops.mczjugamecore.player.strategy.AbstractPlayerQuitStrategy;
 import com.github.mczjuops.mczjugamecore.player.strategy.PlayerQuitReason;
@@ -17,12 +19,11 @@ import com.mczju.ceasefire.CeasefireWar;
 import com.mczju.ceasefire.block.BlockChangeTracker;
 import com.mczju.ceasefire.game.menu.ProfessionMenu;
 import com.mczju.ceasefire.game.menu.RecipeChoiceMenu;
-import com.mczju.ceasefire.player.CeasefirePlayerData;
+import com.mczju.ceasefire.item.TeamSelectItem;
 import com.mczju.ceasefire.profession.Profession;
 import com.mczju.ceasefire.room.CeasefireRoom;
 import com.mczju.ceasefire.utils.SoundUtil;
 import net.kyori.adventure.bossbar.BossBar;
-import net.kyori.adventure.text.Component;
 import net.kyori.adventure.title.Title;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
@@ -31,16 +32,13 @@ import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.WorldBorder;
 import org.bukkit.block.Block;
+import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitTask;
-import org.bukkit.scoreboard.Criteria;
-import org.bukkit.scoreboard.DisplaySlot;
-import org.bukkit.scoreboard.Objective;
-import org.bukkit.scoreboard.Scoreboard;
 import org.jetbrains.annotations.NotNull;
 
 import java.time.Duration;
@@ -50,6 +48,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -58,8 +57,13 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * 停战之战（The War of Ceasefire）：2~4 队资源收集与团队对抗（最少 2 人，可 1v1 / 1v1v1 / 2v2）。
- * 已实现：方块记录与还原（含桶生成物）、缩圈与时间上限（决战时刻）、分队/队长、开局物品+指南针、
- * 多资源点矿物/知识之书生成、职业/知识之书双模式/职业配方、复活与团灭、击杀榜、断线判负。
+ *
+ * <p>已实现：方块记录与还原（含桶生成物）、缩圈与时间上限（决战时刻）、等待阶段自选队伍、
+ * 开局物品+指南针、多资源点矿物/知识之书生成（含仅 4 队时叠加的第二类生成点）、
+ * 职业/知识之书双模式/职业配方、复活与团灭、断线判负。
+ *
+ * <p>1.1 起：移除持久化 KD 统计与「按 KD 选队长」；移除实时击杀榜侧边栏；
+ * 每局击败/死亡只保存在内存，并在对局结束时于聊天框播报。
  */
 public final class CeasefireGame extends AbstractGame {
 
@@ -70,6 +74,14 @@ public final class CeasefireGame extends AbstractGame {
 
     /** 本局所在世界（运行时字段，不序列化）。 */
     private World gameWorld;
+
+    /** 开局前该世界边界的状态，用于对局结束（cleanup）时还原；未改动过边界时为 false。 */
+    private boolean borderTouched;
+    private World borderWorld;
+    private double originalBorderSize;
+    private Location originalBorderCenter;
+    private int originalBorderWarningDistance;
+    private int originalBorderWarningTicks;
 
     /** 每队独立语音组 ID（安装 Simple Voice Chat 时创建），终局统一移除。 */
     private final List<UUID> voiceGroupIds = new ArrayList<>();
@@ -102,6 +114,9 @@ public final class CeasefireGame extends AbstractGame {
     /** 永久出局（决战阵亡 / 团灭 / 退出）的玩家 UUID，不再复活。 */
     private final Set<UUID> eliminated = new HashSet<>();
 
+    /** 死亡事件被取消（对局正好被这一死终结）的玩家 UUID —— 他们已经活着，不能再调 respawn。 */
+    private final Set<UUID> cancelledDeaths = new HashSet<>();
+
     /** 是否处于决战时刻（时间上限到达后：关闭复活，死亡即淘汰）。 */
     private boolean suddenDeath = false;
 
@@ -114,11 +129,11 @@ public final class CeasefireGame extends AbstractGame {
     /** 复活倒计时任务句柄。 */
     private BukkitTask reviveTask;
 
-    /** 单局击杀数（玩家 UUID -> 击杀数），用于局内排行榜。 */
+    /** 单局击败数（玩家 UUID -> 击败数），仅存内存，对局结束时播报。 */
     private final Map<UUID, Integer> roundKills = new HashMap<>();
 
-    /** 排行榜侧边栏更新任务句柄。 */
-    private BukkitTask scoreboardTask;
+    /** 单局死亡数（玩家 UUID -> 死亡数），仅存内存，对局结束时播报。 */
+    private final Map<UUID, Integer> roundDeaths = new HashMap<>();
 
     /** 开局时间戳（复活时间随对局延长）。 */
     private long startTime;
@@ -130,7 +145,7 @@ public final class CeasefireGame extends AbstractGame {
             "<green>[绿队]</green> "
     };
 
-    /** 人数 -> 队伍数（自动适配）：2=1v1, 3=1v1v1, 4=2v2, 6=3v3, 8=2v2v2v2, 9=3v3v3, 10=5v5, 12=3v3v3v3；5/7/11 等其余人数禁止开局。 */
+    /** 人数 -> 队伍数：2=1v1, 3=1v1v1, 4=2v2, 6=3v3, 8=2v2v2v2, 9=3v3v3, 10=5v5, 12=3v3v3v3；5/7/11 沿用上一次有效队伍数，其余人数禁止开局。 */
     private static final Map<Integer, Integer> PLAYER_COUNT_TO_TEAMS = Map.of(
             2, 2,
             3, 3,
@@ -142,8 +157,14 @@ public final class CeasefireGame extends AbstractGame {
             12, 4
     );
 
-    /** 本局实际队伍数。 */
+    /** 本局实际队伍数（等待阶段随人数变化重算）。 */
     private int activeTeamCount = 0;
+
+    /** 上一次由「有效人数」算出的队伍数；5/7/11 人时沿用该值。 */
+    private int lastValidTeamCount = 0;
+
+    /** 本局是否已发放过开局物品（金苹果每局仅可获得一次）。 */
+    private boolean startItemsGranted = false;
 
     /** 准备阶段是否进行中（禁锢玩家 + 选职业）。 */
     private boolean prepActive = false;
@@ -223,7 +244,8 @@ public final class CeasefireGame extends AbstractGame {
     @Override
     protected void onGameStart() {
         startTime = System.currentTimeMillis();
-        assignTeams();
+        finalizeTeams();
+        clearInventoriesOnStart();
         assignTeamSpawns();
         teleportTeamsToSpawns();
         gameWorld = resolveGameWorld();
@@ -414,39 +436,259 @@ public final class CeasefireGame extends AbstractGame {
         };
     }
 
-    private void assignTeams() {
-        teamMap.clear();
-        List<PlayerExt> players = new ArrayList<>(getPlayers());
-        if (players.isEmpty()) {
+    // ==================== 等待阶段：自选队伍与动态队伍数 ====================
+
+    /**
+     * 等待阶段重算队伍数。
+     *
+     * <p>队伍数由当前人数决定；5/7/11 人不在映射表内，沿用上一次有效队伍数。
+     * 队伍数变少时，超出范围的已选玩家会被移出队伍，并向全体提示重新选队。
+     */
+    public void refreshWaitingTeams() {
+        int playerCount = getPlayers().size();
+        Integer mapped = PLAYER_COUNT_TO_TEAMS.get(playerCount);
+        if (mapped != null) {
+            lastValidTeamCount = mapped;
+        } else if (lastValidTeamCount <= 0) {
+            return; // 还没有出现过有效人数，暂不分队。
+        } else {
+            mapped = lastValidTeamCount;
+        }
+
+        if (mapped == activeTeamCount) {
             return;
         }
-        CeasefireRoom room = (CeasefireRoom) getGameRoom();
-        int teamCount = getTeamCountForPlayers(players.size());
-        if (teamCount < 0) {
-            return; // 不该发生（tryStart 已检查）。
+        boolean shrunk = activeTeamCount > 0 && mapped < activeTeamCount;
+        activeTeamCount = mapped;
+
+        if (shrunk) {
+            // 队伍数下降：把已经选在「被裁掉的那些队」里的玩家移出队伍。
+            teamMap.entrySet().removeIf(entry -> entry.getValue() >= activeTeamCount);
+            sender().warn("<yellow>队伍数发生变化，请重新选择队伍。");
+            giveTeamSelectItems();
         }
-        activeTeamCount = teamCount;
+    }
 
-        players.sort((a, b) -> Double.compare(kd(b), kd(a)));
+    /** 开局：未选队的玩家随机补齐（优先补进人数最少的队，保持均衡），并刷新 Tab 前缀。 */
+    private void finalizeTeams() {
+        refreshWaitingTeams();
+        if (activeTeamCount <= 0) {
+            activeTeamCount = 2; // 兜底：正常不会走到（tryStart 已校验人数）。
+        }
 
-        List<PlayerExt> rest = new ArrayList<>();
-        for (int i = 0; i < players.size(); i++) {
-            if (i < teamCount) {
-                teamMap.put(players.get(i).getUniqueId(), i);
-            } else {
-                rest.add(players.get(i));
+        List<PlayerExt> unassigned = new ArrayList<>();
+        for (PlayerExt p : getPlayers()) {
+            if (getTeam(p) < 0) {
+                unassigned.add(p);
             }
         }
-        Collections.shuffle(rest);
-        for (int i = 0; i < rest.size(); i++) {
-            teamMap.put(rest.get(i).getUniqueId(), i % teamCount);
+        Collections.shuffle(unassigned);
+        for (PlayerExt p : unassigned) {
+            teamMap.put(p.getUniqueId(), smallestTeam());
         }
+        ensureNoEmptyTeams();
 
         TabManager tab = MCZJUGameCore.getTabManager();
-        for (PlayerExt p : players) {
-            int team = teamMap.get(p.getUniqueId());
+        for (PlayerExt p : getPlayers()) {
+            int team = getTeam(p);
+            removeTeamSelectItems(p.player());
+            if (team < 0) {
+                continue;
+            }
             tab.setPrefix(this, p, TEAM_PREFIXES[team % TEAM_PREFIXES.length]);
         }
+    }
+
+    /**
+     * 兜底：确保开局时没有空队伍。
+     *
+     * <p>每队上限是「向上取整(人数 / 队伍数)」，空队伍在数学上不会出现；
+     * 这里仍做一次检查，从人数最多的队调一人过去。
+     */
+    private void ensureNoEmptyTeams() {
+        for (int team = 0; team < activeTeamCount; team++) {
+            if (!getTeamPlayers(team).isEmpty()) {
+                continue;
+            }
+            int largestTeam = -1;
+            int largestSize = 1; // 只在「多于一人的队」里挑，避免把仅剩的队也搬空。
+            for (int t = 0; t < activeTeamCount; t++) {
+                int size = getTeamPlayers(t).size();
+                if (size > largestSize) {
+                    largestSize = size;
+                    largestTeam = t;
+                }
+            }
+            if (largestTeam < 0) {
+                continue;
+            }
+            PlayerExt moved = getTeamPlayers(largestTeam).get(0);
+            teamMap.put(moved.getUniqueId(), team);
+            sender().info("<yellow>%s</yellow> <gray>被调整到</gray> <white>%s</white>".formatted(
+                    moved.getDisplayName(), teamName(team)));
+        }
+    }
+
+    /** 开局后清除背包里的选队物品（该物品仅在等待阶段有用）。 */
+    private static void removeTeamSelectItems(Player player) {
+        ItemStack[] contents = player.getInventory().getContents();
+        for (int i = 0; i < contents.length; i++) {
+            ItemStack stack = contents[i];
+            if (stack != null && MCZJUGameCore.getItemManager().is(stack, TeamSelectItem.ID)) {
+                player.getInventory().setItem(i, null);
+            }
+        }
+    }
+
+    /** 当前人数最少的队伍编号（并列时随机），用于随机补位时保持均衡。 */
+    private int smallestTeam() {
+        int capacity = teamCapacity();
+        int[] counts = new int[activeTeamCount];
+        for (PlayerExt p : getPlayers()) {
+            int team = getTeam(p);
+            if (team >= 0 && team < activeTeamCount) {
+                counts[team]++;
+            }
+        }
+        int min = Integer.MAX_VALUE;
+        List<Integer> ties = new ArrayList<>();
+        for (int team = 0; team < activeTeamCount; team++) {
+            if (capacity > 0 && counts[team] >= capacity) {
+                continue; // 该队已满，跳过。
+            }
+            if (counts[team] < min) {
+                min = counts[team];
+                ties.clear();
+                ties.add(team);
+            } else if (counts[team] == min) {
+                ties.add(team);
+            }
+        }
+        if (ties.isEmpty()) {
+            return 0; // 理论上不会发生：每队上限 × 队伍数 >= 总人数。
+        }
+        return ties.get(ThreadLocalRandom.current().nextInt(ties.size()));
+    }
+
+    /**
+     * 当前每队人数上限 = 向上取整(人数 / 队伍数)。
+     *
+     * <p>向上取整保证「上限 × 队伍数 ≥ 总人数」，因此既不会有人无处可去，
+     * 也顺带保证开局时不会出现空队伍。例：9 人 3 队 → 每队 3 人。
+     */
+    public int teamCapacity() {
+        if (activeTeamCount <= 0) {
+            return 0;
+        }
+        int players = getPlayers().size();
+        return (players + activeTeamCount - 1) / activeTeamCount;
+    }
+
+    /**
+     * 是否存在某支队伍的人数超过当前上限。
+     *
+     * <p>上限只在「选队那一刻」强制；人数减少会使上限变小，此时已在队里的玩家不会被自动移出，
+     * 于是可能出现短暂的超员。这种情况下不允许开局。
+     */
+    public boolean hasTeamOverCapacity() {
+        if (activeTeamCount <= 0) {
+            return false;
+        }
+        int capacity = teamCapacity();
+        for (int team = 0; team < activeTeamCount; team++) {
+            if (getTeamPlayers(team).size() > capacity) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 本局队伍数（等待阶段随人数变化）。 */
+    public int getActiveTeamCount() {
+        return activeTeamCount;
+    }
+
+    /** 等待阶段玩家自选队伍；成功返回 true。 */
+    public boolean selectTeam(PlayerExt player, int team) {
+        if (getState() != GameState.WAITING) {
+            player.sender().warn("<red>对局已经开始，无法再更换队伍");
+            return false;
+        }
+        if (activeTeamCount <= 0) {
+            player.sender().warn("<red>当前人数还不足以确定队伍数，请等待更多玩家加入");
+            return false;
+        }
+        if (team < 0 || team >= activeTeamCount) {
+            player.sender().warn("<red>本局只有 %d 支队伍，无法加入该队".formatted(activeTeamCount));
+            return false;
+        }
+
+        int previous = getTeam(player);
+        if (previous == team) {
+            player.sender().info("<gray>你已经在 <white>%s</white> 了".formatted(teamName(team)));
+            return true;
+        }
+        // 队伍人数上限：9 人 3 队时每队 3 人，第 4 人申请入队会被驳回。
+        int capacity = teamCapacity();
+        if (capacity > 0 && getTeamPlayers(team).size() >= capacity) {
+            player.sender().warn("<red>队伍人数已达上限。");
+            return false;
+        }
+        if (previous >= 0) {
+            sender().info("<yellow>%s</yellow> <gray>离开了</gray> %s".formatted(
+                    player.getDisplayName(), teamName(previous)));
+        }
+        teamMap.put(player.getUniqueId(), team);
+        sender().info("<yellow>%s</yellow> <gray>加入了</gray> <white>%s</white>".formatted(
+                player.getDisplayName(), teamName(team)));
+        return true;
+    }
+
+    /** 把等待中所有玩家的选队物品归位到快捷栏第 5 格。 */
+    public void giveTeamSelectItems() {
+        for (PlayerExt p : getPlayers()) {
+            giveTeamSelectItem(p);
+        }
+    }
+
+    /** 把单个玩家的选队物品归位到快捷栏第 5 格（重复副本会被清除）。 */
+    public void giveTeamSelectItem(PlayerExt player) {
+        TeamSelectItem.ensureInFixedSlot(player.player());
+    }
+
+    /**
+     * 整支 MGC 队伍（party）加入等待房：按含全队的新人数重算队伍数与每队上限、补发选队物品，
+     * 然后**立刻解散该队伍**，让所有人回到「待选队」状态各自选队。
+     *
+     * <p>本局每队人数由总人数刚性决定（{@code ceil(人数 / 队伍数)}），大队伍无法保证同队，
+     * 因此这里不做同队分配，直接解散交给玩家自选。
+     * 解散后 {@code teamMap} 中没有这些玩家，{@code getTeam()} 返回 {@code -1}，
+     * 天然就是「待选队」状态，无需额外代码。
+     */
+    public void acceptParty(Party party) {
+        int size = party.size();
+        // 先按「含全队」的人数重算：队伍数与每队上限都会随之变化。
+        refreshWaitingTeams();
+        // refreshWaitingTeams() 只在「队伍数减少」的分支里补发选队物品，
+        // 而整队加入多半是增长（例如 12 人：2 队 → 4 队），所以这里显式补一次，
+        // 保证刚进来的整队也能拿到「选择队伍」物品（否则播报让右键下界之星，玩家手里却没有）。
+        giveTeamSelectItems();
+
+        // MGC 的 disbandPartyInternal 不通知成员，这里由插件播报。
+        DisbandResult result = MCZJUGameCore.getPartymanager().disband(party.getLeader());
+        if (result == DisbandResult.SUCCESS) {
+            sender().info("<gray>一支 <white>%d 人</white> 的队伍加入了等待房，<yellow>队伍已自动解散</yellow>。".formatted(size));
+        } else {
+            // 理论上不会发生（队长必然在队伍中）；兜底记录，避免玩家停在旧的组队状态。
+            logger.warn("解散队伍失败：%s（队长 %s）".formatted(result, party.getLeader().getName()));
+            sender().info("<gray>一支 <white>%d 人</white> 的队伍加入了等待房。".formatted(size));
+        }
+        sender().info("<gray>请各自选择队伍：右键手中的 <white>下界之星</white>，或使用 <white>/ceasefire team <颜色></white>");
+    }
+
+    /** 第二类生成点是否生效：仅当本局队伍数为 4。 */
+    private boolean secondPointsActive() {
+        return activeTeamCount == 4;
     }
 
     /** 分配各队出生点：出生点随机洗牌，取前 teamCount 个，每队一个。 */
@@ -475,15 +717,84 @@ public final class CeasefireGame extends AbstractGame {
         }
     }
 
-    private double kd(PlayerExt player) {
-        CeasefirePlayerData data = player.getData(CeasefirePlayerData.class);
-        if (data.deaths <= 0) {
-            return data.kills;
+    /**
+     * 正式开局时把玩家切到房间配置的游戏模式。
+     *
+     * <p>大厅档案默认把玩家设为 ADVENTURE，而 MGC 切到游戏档案时**不会**改模式，
+     * 不切的话玩家放不下开局发的木板 / 羊毛，也拆不掉自己搭的防御。
+     * 房间字段 {@code gameMode} 留空或非法时不干预。
+     */
+    private void applyGameMode() {
+        GameMode mode = parseGameMode(((CeasefireRoom) getGameRoom()).gameMode);
+        if (mode == null) {
+            return;
         }
-        return (double) data.kills / data.deaths;
+        for (PlayerExt p : getPlayers()) {
+            if (p.player().getGameMode() != mode) {
+                p.player().setGameMode(mode);
+            }
+        }
+    }
+
+    /** 房间是否开启「结束清空物品栏」。 */
+    private boolean isInventoryClearEnabled() {
+        return getGameRoom() instanceof CeasefireRoom room && room.clearInventoryOnEnd;
+    }
+
+    /**
+     * 清空单个玩家的物品栏（主栏 + 4 格护甲 + 副手，共 41 格）与末影箱。
+     *
+     * <p>MGC 会在玩家离开对局时（`switchProfile(null)`）把**当前**物品栏存进该游戏的档案快照，
+     * 且该快照从不删除。只有在那之前清空，快照才是空的，下一局才不会被上一局的装备污染
+     * （也堵住了中途 `/mgc leave` 把装备「存」进下一局的漏洞）。
+     */
+    private void clearInventory(Player player) {
+        if (player == null || !isInventoryClearEnabled()) {
+            return;
+        }
+        player.getInventory().clear();
+        player.getEnderChest().clear();
+    }
+
+    /** 解析房间配置的游戏模式；留空或非法返回 null（表示不干预，沿用当前模式）。 */
+    private GameMode parseGameMode(String configured) {
+        if (configured == null || configured.isBlank()) {
+            return null;
+        }
+        try {
+            return GameMode.valueOf(configured.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            logger.warn("房间 %s 的 gameMode 配置无效：%s（应为 SURVIVAL / ADVENTURE / CREATIVE），本次不干预"
+                    .formatted(getGameRoom().getRoomName(), configured));
+            return null;
+        }
+    }
+
+    /** 开局清空所有玩家的背包与末影箱（房间开关 clearInventoryOnStart，默认开）。 */
+    private void clearInventoriesOnStart() {
+        CeasefireRoom room = (CeasefireRoom) getGameRoom();
+        if (!room.clearInventoryOnStart) {
+            return;
+        }
+        for (PlayerExt p : getPlayers()) {
+            p.player().getInventory().clear();
+            p.player().getEnderChest().clear();
+        }
+    }
+
+    /** 让单个玩家隐藏「时间上限 / 决战时刻」BossBar（中途退出必须单独处理，否则他会一直看着那条倒计时）。 */
+    private void hideTimeBossBarFor(Player player) {
+        if (timeBossBar != null && player != null && player.isOnline()) {
+            player.hideBossBar(timeBossBar);
+        }
     }
 
     private void giveStartItems() {
+        if (startItemsGranted) {
+            return; // 开局物品每局仅发放一次（金苹果依赖此保证）。
+        }
+        startItemsGranted = true;
+
         CeasefireRoom room = (CeasefireRoom) getGameRoom();
         for (PlayerExt p : getPlayers()) {
             Player player = p.player();
@@ -495,6 +806,14 @@ public final class CeasefireGame extends AbstractGame {
             );
             if (room.startCraftingTables > 0) {
                 player.getInventory().addItem(new ItemStack(Material.CRAFTING_TABLE, room.startCraftingTables));
+            }
+            // 金苹果：只在开局发放，复活走 giveRespawnItems()（那里不发金苹果）。
+            if (room.startGoldenApples > 0) {
+                player.getInventory().addItem(new ItemStack(Material.GOLDEN_APPLE, room.startGoldenApples));
+            }
+            // 金胡萝卜：开局与每次复活都发放（同一个配置项）。
+            if (room.goldenCarrots > 0) {
+                player.getInventory().addItem(new ItemStack(Material.GOLDEN_CARROT, room.goldenCarrots));
             }
             player.getInventory().addItem(
                     ItemBuilder.of(Material.COMPASS)
@@ -579,6 +898,8 @@ public final class CeasefireGame extends AbstractGame {
             return;
         }
         WorldBorder border = world.getWorldBorder();
+        // 先记录开局前的边界，终局在 cleanup() 里按 restoreBorderOnEnd 还原。
+        snapshotBorder(room, world, border);
         border.setCenter(room.borderCenter.getX(), room.borderCenter.getZ());
         border.setSize(room.borderInitialSize);
         border.setWarningDistance(10);
@@ -597,6 +918,10 @@ public final class CeasefireGame extends AbstractGame {
         if (room.mineralSpawnPoint != null) {
             points.add(room.mineralSpawnPoint);
         }
+        // 第二类生成点仅在 4 队局时叠加生效。
+        if (secondPointsActive()) {
+            points.addAll(room.mineralSpawnPoints2);
+        }
         return points.stream().filter(loc -> loc != null && loc.getWorld() != null).distinct().toList();
     }
 
@@ -607,10 +932,17 @@ public final class CeasefireGame extends AbstractGame {
         if (room.bookSpawnPoint != null) {
             points.add(room.bookSpawnPoint);
         }
+        // 第二类生成点仅在 4 队局时叠加生效。
+        if (secondPointsActive()) {
+            points.addAll(room.bookSpawnPoints2);
+        }
         return points.stream().filter(loc -> loc != null && loc.getWorld() != null).distinct().toList();
     }
 
     private void startMineralSpawn() {
+        if (mineralTask != null) {
+            return; // 已启动过：防止任务句柄被覆盖后旧任务泄漏、对局结束后仍继续掉落
+        }
         CeasefireRoom room = (CeasefireRoom) getGameRoom();
         if (effectiveMineralPoints().isEmpty()) {
             return;
@@ -650,6 +982,9 @@ public final class CeasefireGame extends AbstractGame {
 
     /** 定时在每个知识之书生成点掉落知识之书。 */
     private void startBookSpawn() {
+        if (bookTask != null) {
+            return; // 已启动过：防止任务句柄被覆盖后旧任务泄漏、对局结束后仍继续掉落
+        }
         CeasefireRoom room = (CeasefireRoom) getGameRoom();
         if (effectiveBookPoints().isEmpty()) {
             return;
@@ -670,19 +1005,14 @@ public final class CeasefireGame extends AbstractGame {
         }
     }
 
-    /** 玩家死亡处理：KD 统计、复活等待或决战淘汰、团灭判定。 */
+    /** 玩家死亡处理：本局击败/死亡统计、复活等待或决战淘汰、团灭判定。 */
     public void handlePlayerDeath(PlayerExt player, PlayerDeathEvent event) {
-        CeasefirePlayerData data = player.getData(CeasefirePlayerData.class);
-        data.deaths++;
-        data.setModified(true);
+        roundDeaths.merge(player.getUniqueId(), 1, Integer::sum);
 
         Player killer = player.player().getKiller();
         if (killer != null) {
             PlayerExt killerExt = new PlayerExt(killer);
             if (killerExt.getGame() == this) {
-                CeasefirePlayerData kd = killerExt.getData(CeasefirePlayerData.class);
-                kd.kills++;
-                kd.setModified(true);
                 roundKills.merge(killer.getUniqueId(), 1, Integer::sum);
                 SoundUtil.killed(killer);
             }
@@ -702,6 +1032,7 @@ public final class CeasefireGame extends AbstractGame {
             respawnAsSpectator(player, randomSpawnPoint());
             checkTeamWipe(getTeam(player));
             checkWin();
+            cancelDeathIfGameEnded(player, event);
             return;
         }
 
@@ -712,6 +1043,29 @@ public final class CeasefireGame extends AbstractGame {
         respawnAsSpectator(player, randomSpawnPoint());
 
         checkTeamWipe(getTeam(player));
+        cancelDeathIfGameEnded(player, event);
+    }
+
+    /**
+     * 如果这一死直接把对局打完了，就**取消这次死亡**。
+     *
+     * <p>原因：`checkTeamWipe → checkWin → endGame → cleanup` 全都在**死亡事件的调用栈内**同步跑完，
+     * 也就是"对局结束"发生在原版生成死亡掉落、把玩家推上死亡界面**之前**。于是：
+     * <ul>
+     *   <li>死亡界面会一直留着 —— 1 tick 后的补救时常因为血量已被大厅档案复原而判断失效；</li>
+     *   <li>掉落物在 cleanup 之后才生成，`removeDroppedItems()` 扫不到，留在地上。</li>
+     * </ul>
+     * 直接取消死亡可以一次性解决这两件事：玩家不死 → 没有死亡界面、也没有掉落物。
+     */
+    private void cancelDeathIfGameEnded(PlayerExt player, PlayerDeathEvent event) {
+        if (!finished || event.isCancelled()) {
+            return;
+        }
+        event.setCancelled(true);
+        cancelledDeaths.add(player.getUniqueId());
+        if (player.player().isOnline()) {
+            player.resetState(); // 回满血、清火焰/药水，避免取消死亡后停在残状态
+        }
     }
 
     /**
@@ -724,17 +1078,18 @@ public final class CeasefireGame extends AbstractGame {
             if (!p.isOnline()) {
                 return;
             }
-            // 死亡屏幕中 health = 0；存活玩家不调用 respawn（对活人调用会触发重生点传送）。
-            boolean onDeathScreen = p.getHealth() <= 0.0D;
+            // 本方法只由「刚死亡」的玩家触发，但**不能**再用 health<=0 判断是否在死亡界面：
+            // 对局结束这条路径上，框架的 switchProfile(null) 会先把血量复原成 20，判断就失效了，
+            // 于是最后一名死者会一直停在死亡界面（Bug：最后一个被杀的卡重生界面）。
             if (getState() == GameState.END) {
-                if (onDeathScreen) {
+                // 这次死亡如果已经被 cancelDeathIfGameEnded 取消，玩家根本没死 —— 不能对他调 respawn
+                //（对活人调用会触发重生点传送，可能把人从大厅拽回世界出生点）。
+                if (!cancelledDeaths.remove(p.getUniqueId())) {
                     p.spigot().respawn();
                 }
                 return;
             }
-            if (onDeathScreen) {
-                p.spigot().respawn();
-            }
+            p.spigot().respawn();   // 无条件：本任务只由「刚死亡」的玩家触发，他一定在死亡界面
             p.setGameMode(GameMode.SPECTATOR);
             if (target != null) {
                 p.teleport(target);
@@ -772,7 +1127,7 @@ public final class CeasefireGame extends AbstractGame {
 
     private void revive(PlayerExt player) {
         Player p = player.player();
-        p.setGameMode(GameMode.SURVIVAL);
+        p.setGameMode(GameMode.SURVIVAL);   // 复活必须回到生存，否则复活后不能挖/放方块
         Location loc = findReviveLocation(player);
         if (loc != null) {
             p.teleport(loc);
@@ -835,7 +1190,7 @@ public final class CeasefireGame extends AbstractGame {
         return room.spawnPoints.get(ThreadLocalRandom.current().nextInt(room.spawnPoints.size()));
     }
 
-    /** 复活物品：木板、木棍、羊毛、木剑、工作台（不含指南针，指南针每局仅一次）。 */
+    /** 复活物品：木板、木棍、羊毛、木剑、工作台、金胡萝卜（不含指南针与金苹果，二者每局仅一次）。 */
     private void giveRespawnItems(PlayerExt p) {
         CeasefireRoom room = (CeasefireRoom) getGameRoom();
         p.player().getInventory().addItem(
@@ -846,6 +1201,9 @@ public final class CeasefireGame extends AbstractGame {
         );
         if (room.startCraftingTables > 0) {
             p.player().getInventory().addItem(new ItemStack(Material.CRAFTING_TABLE, room.startCraftingTables));
+        }
+        if (room.goldenCarrots > 0) {
+            p.player().getInventory().addItem(new ItemStack(Material.GOLDEN_CARROT, room.goldenCarrots));
         }
     }
 
@@ -883,14 +1241,17 @@ public final class CeasefireGame extends AbstractGame {
         int aliveTeams = 0;
         int aliveTeam = -1;
         for (int t = 0; t < activeTeamCount; t++) {
-            if (!wipedTeams.contains(t)) {
-                aliveTeams++;
-                aliveTeam = t;
+            // 自选队伍可能出现空队；空队不参与胜负判定，否则空队会「获胜」。
+            if (wipedTeams.contains(t) || getTeamPlayers(t).isEmpty()) {
+                continue;
             }
+            aliveTeams++;
+            aliveTeam = t;
         }
         if (aliveTeams == 1) {
             finished = true;
             sender().info("<gold>%s 获得胜利！".formatted(teamName(aliveTeam)));
+            broadcastRoundStats();
             SoundUtil.victory(getPlayers());
             for (PlayerExt p : getPlayers()) {
                 p.player().showTitle(Title.title(
@@ -902,8 +1263,46 @@ public final class CeasefireGame extends AbstractGame {
         }
     }
 
+    /** 对局结束：在聊天框播报本局每名参与者的击败/死亡数，形式为 玩家名/K击败/D死亡。 */
+    private void broadcastRoundStats() {
+        List<UUID> participants = new ArrayList<>(teamMap.keySet());
+        participants.sort((a, b) -> {
+            int teamA = teamMap.getOrDefault(a, Integer.MAX_VALUE);
+            int teamB = teamMap.getOrDefault(b, Integer.MAX_VALUE);
+            if (teamA != teamB) {
+                return Integer.compare(teamA, teamB);
+            }
+            int killsA = roundKills.getOrDefault(a, 0);
+            int killsB = roundKills.getOrDefault(b, 0);
+            if (killsA != killsB) {
+                return Integer.compare(killsB, killsA);
+            }
+            return nameOf(a).compareToIgnoreCase(nameOf(b));
+        });
+
+        sender().info("<gold><b>本局战绩</b>");
+        for (UUID id : participants) {
+            sender().info("<white>%s<gray>/K%s/D%s".formatted(
+                    nameOf(id),
+                    roundKills.getOrDefault(id, 0),
+                    roundDeaths.getOrDefault(id, 0)));
+        }
+    }
+
+    /** 解析玩家名；离线且无记录时退化为 UUID 前 8 位。 */
+    private static String nameOf(UUID id) {
+        String name = Bukkit.getOfflinePlayer(id).getName();
+        return name != null ? name : id.toString().substring(0, 8);
+    }
+
     /** 中途退出：判负出局、比赛继续；场上无人时终止对局。 */
     public void handlePlayerQuit(PlayerExt player, PlayerQuitReason reason) {
+        // 中途退出：先收掉他身上的 BossBar，否则他会一直看着那条倒计时
+        //（cleanup() 只处理还留在局内的玩家，退出者此时已被移出 getPlayers()）。
+        hideTimeBossBarFor(player.player());
+        // 中途退出也要清空背包：框架是在退出策略**之后**才 switchProfile(null) 捕获物品栏的，
+        // 不清的话整套装备会被存进本局档案、下一局开局直接带出来（刷装备漏洞）。
+        clearInventory(player.player());
         GameState state = getState();
         if (state == GameState.WAITING || state == GameState.END || finished) {
             return; // 等待阶段退出不影响对局；终局后忽略。
@@ -928,7 +1327,8 @@ public final class CeasefireGame extends AbstractGame {
         }
     }
 
-    private String teamName(int team) {
+    /** 队伍编号对应的显示名（0=红 1=蓝 2=黄 3=绿）。 */
+    public static String teamName(int team) {
         String[] names = {"红队", "蓝队", "黄队", "绿队"};
         return names[Math.floorMod(team, names.length)];
     }
@@ -1049,37 +1449,6 @@ public final class CeasefireGame extends AbstractGame {
         return "%d:%02d".formatted(seconds / 60, seconds % 60);
     }
 
-    /** 局内击杀榜侧边栏，每秒刷新。 */
-    private void startScoreboard() {
-        Scoreboard board = Bukkit.getScoreboardManager().getNewScoreboard();
-        Objective obj = board.registerNewObjective("kills", Criteria.DUMMY, Component.text("击杀榜"));
-        obj.setDisplaySlot(DisplaySlot.SIDEBAR);
-        for (PlayerExt p : getPlayers()) {
-            p.player().setScoreboard(board);
-        }
-        scoreboardTask = Bukkit.getScheduler().runTaskTimer(
-                CeasefireWar.getInstance(), () -> updateScoreboard(board, obj), 0L, 20L);
-    }
-
-    private void updateScoreboard(Scoreboard board, Objective obj) {
-        for (String entry : board.getEntries()) {
-            board.resetScores(entry);
-        }
-        List<Map.Entry<UUID, Integer>> sorted = new ArrayList<>(roundKills.entrySet());
-        sorted.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
-        int rank = 0;
-        for (Map.Entry<UUID, Integer> e : sorted) {
-            if (rank++ >= 15) {
-                break;
-            }
-            Player p = Bukkit.getPlayer(e.getKey());
-            if (p == null || !p.isOnline()) {
-                continue;
-            }
-            obj.getScore(p.getName()).setScore(e.getValue());
-        }
-    }
-
     /** 是否处于准备阶段（用于禁锢玩家）。 */
     public boolean isPrepPhase() {
         return prepActive;
@@ -1161,7 +1530,7 @@ public final class CeasefireGame extends AbstractGame {
         }, 20L, 20L);
     }
 
-    /** 正式开始：解除禁锢，发物品，启动缩圈/生成/复活/排行榜/时间上限。 */
+    /** 正式开始：解除禁锢，发物品，启动缩圈/生成/复活/时间上限。 */
     private void startGameplay() {
         prepActive = false;
         if (prepTask != null) {
@@ -1172,13 +1541,13 @@ public final class CeasefireGame extends AbstractGame {
             countdownTask.cancel();
             countdownTask = null;
         }
+        applyGameMode();
         giveStartItems();
         startBorder();
         startCompassTask();
         startMineralSpawn();
         startBookSpawn();
         startReviveTask();
-        startScoreboard();
         startTimeLimit();
         SoundUtil.gameBegin(getPlayers());
         for (PlayerExt p : getPlayers()) {
@@ -1189,7 +1558,36 @@ public final class CeasefireGame extends AbstractGame {
         }
     }
 
+    /** 执行一个清理步骤：任何异常只影响这一步，不会连锁跳过后续步骤（一个 bug 不能拖垮整条收尾流程）。 */
+    private void step(String name, Runnable action) {
+        try {
+            action.run();
+        } catch (Throwable t) {
+            logger.error("[Ceasefire] 清理步骤「" + name + "」失败：" + t);
+            for (StackTraceElement el : t.getStackTrace()) {
+                logger.error("    at " + el);
+            }
+        }
+    }
+
     private void cleanup() {
+        // 第一步就清空玩家背包：框架在随后的 removeAllPlayer() 里才会 switchProfile(null)，
+        // 把「当前」物品栏存进本局档案快照。此刻清空 → 快照为空 → 下一局不会带上一局的装备。
+        step("清空背包", () -> {
+            for (PlayerExt p : getPlayers()) {
+                clearInventory(p.player());
+            }
+        });
+        // 旁观者回到冒险模式（与大厅一致）：框架只在「大厅档案功能开启」时才设 ADVENTURE，
+        // 关掉时死亡玩家会一直停在旁观，表现为「复活后和谁都交互不了」。
+        step("恢复旁观者模式", () -> {
+            for (PlayerExt p : getPlayers()) {
+                Player pl = p.player();
+                if (pl.isOnline() && pl.getGameMode() == GameMode.SPECTATOR) {
+                    pl.setGameMode(GameMode.ADVENTURE);
+                }
+            }
+        });
         if (borderTask != null) {
             borderTask.cancel();
             borderTask = null;
@@ -1210,10 +1608,6 @@ public final class CeasefireGame extends AbstractGame {
             reviveTask.cancel();
             reviveTask = null;
         }
-        if (scoreboardTask != null) {
-            scoreboardTask.cancel();
-            scoreboardTask = null;
-        }
         if (prepTask != null) {
             prepTask.cancel();
             prepTask = null;
@@ -1227,17 +1621,202 @@ public final class CeasefireGame extends AbstractGame {
             finalGlowTask.cancel();
             finalGlowTask = null;
         }
-        if (timeBossBar != null) {
-            for (PlayerExt p : getPlayers()) {
-                p.player().hideBossBar(timeBossBar);
+        step("收起 BossBar", () -> {
+            if (timeBossBar != null) {
+                for (PlayerExt p : getPlayers()) {
+                    p.player().hideBossBar(timeBossBar);
+                }
+                timeBossBar = null;
             }
-            timeBossBar = null;
-        }
+        });
         ACTIVE_GAMES.remove(this);
         for (UUID groupId : voiceGroupIds) {
             VoiceGroupUtil.removeGroup(groupId);
         }
         voiceGroupIds.clear();
-        blockTracker.restore(CeasefireWar.getInstance());
+        step("还原世界边界", this::restoreBorder);
+        step("清理掉落物", this::removeDroppedItems);
+        // 原版的死亡掉落是在 PlayerDeathEvent 处理完之后才生成的；如果对局正是被这一死终结，
+        // cleanup 会跑在掉落物生成之前。这里补扫一次（2 tick 后），把这类残留也清掉。
+        if (CeasefireWar.getInstance() != null) {
+            Bukkit.getScheduler().runTaskLater(CeasefireWar.getInstance(), this::removeDroppedItems, 2L);
+            // 按需求：20 tick 后再补检一次，确认没有残留掉落物（死亡掉落可能晚几 tick 才落地）
+            Bukkit.getScheduler().runTaskLater(CeasefireWar.getInstance(), this::removeDroppedItems, 20L);
+        }
+        step("还原方块", () -> blockTracker.restore(CeasefireWar.getInstance()));
+        step("传送回主城", this::schedulePostGameTeleports);
+    }
+
+    /** 记录开局前该世界边界的状态，供对局结束时还原。 */
+    private void snapshotBorder(CeasefireRoom room, World world, WorldBorder border) {
+        if (!room.restoreBorderOnEnd) {
+            return;
+        }
+        borderWorld = world;
+        originalBorderSize = border.getSize();
+        originalBorderCenter = border.getCenter();
+        originalBorderWarningDistance = border.getWarningDistance();
+        originalBorderWarningTicks = border.getWarningTimeTicks();
+        borderTouched = true;
+    }
+
+    /**
+     * 还原开局前的世界边界（大小 / 中心 / 警告距离与警告时间）。
+     *
+     * <p>Minecraft 会把世界边界写进 level.dat，不还原的话该世界会一直停在本局最后缩到的大小，
+     * 影响同世界的其他对局、大厅，甚至服务器重启后的状态。
+     * cancel / abort / end 三条清理路径共用本方法，{@code borderTouched} 保证只还原一次、
+     * 且只在真的改动过边界时才还原（没缩圈的房间不会去盖掉服主原本的设置）。
+     */
+    private void restoreBorder() {
+        if (!borderTouched) {
+            return;
+        }
+        borderTouched = false;
+        if (borderWorld == null) {
+            return;
+        }
+        try {
+            WorldBorder border = borderWorld.getWorldBorder();
+            double before = border.getSize();
+            // 按需求：结束一律回到「世界自带」的边界（level.dat 里的默认值，超级远），
+            // 而不是回到开局前的快照 —— 快照可能本来就已经被上一局缩小过了。
+            border.reset();
+            logger.info("[Ceasefire] 已重置世界边界：" + before + " -> " + border.getSize());
+            logger.info("已还原世界 %s 的边界（%s 格）".formatted(borderWorld.getName(), originalBorderSize));
+        } catch (Exception e) {
+            logger.warn("还原世界边界失败：%s".formatted(e.getMessage()));
+        }
+    }
+
+    /**
+     * 把局内玩家传送回主大厅。
+     *
+     * <p>框架结束对局时**不会移动玩家**（`solveGameEnd` 只做 `removeAllPlayer` + 房间置 READY），
+     * 不补这一步玩家打完会原地站在竞技场里。
+     *
+     * <p>延迟 1 tick 执行：此刻框架还没执行 `removeAllPlayer()` 里的 `switchProfile(null)`，
+     * 等大厅档案（物品栏 / 游戏模式 / 页脚）换好之后再传送，玩家就不会带着游戏状态落地。
+     */
+    private void teleportPlayersToLobby() {
+        if (!(getGameRoom() instanceof CeasefireRoom room) || !room.teleportToLobbyOnEnd) {
+            return;
+        }
+        Location lobby = MCZJUGameCore.getLobbyManager().getMainLobby();
+        if (lobby == null || lobby.getWorld() == null) {
+            logger.warn("主大厅尚未配置或世界未加载，本次不传送回大厅");
+            return;
+        }
+        CeasefireWar plugin = CeasefireWar.getInstance();
+        if (plugin == null) {
+            return; // 关服过程中触发的中止：调度器已不可用，直接跳过
+        }
+        for (PlayerExt p : getPlayers()) {
+            Player player = p.player();
+            Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                if (player.isOnline() && player.teleport(lobby)) {
+                    p.sender().success("已传送回大厅");
+                }
+            }, 1L);
+        }
+    }
+
+    /**
+     * 清除场地内的掉落物（矿物、知识之书、玩家死亡/丢弃的物品等）。
+     *
+     * <p>生成任务本身会在 {@link #cleanup()} 里被取消，所以对局结束后**不会**再产生新的矿物/书；
+     * 本方法处理的是「已经掉在地上的那些」——不清理的话它们会留在上一局的竞技场里，
+     * 影响下一局的资源平衡（原版也要等 5 分钟才自行消失）。
+     *
+     * <p>安全范围：若房间配置了缩圈中心（{@code borderCenter}），只清理以该点为中心、
+     * 初始边界半径（{@code borderInitialSize / 2}）以内的掉落物，
+     * 避免误删同一世界里其他小游戏或大厅的物品；未配置缩圈中心时退回清理整个世界。
+     */
+    /**
+     * 对局结束后把「所有人」送回主城：+1 / +5 / +20 tick 各跑一次。
+     *
+     * <p>为什么要重试：死亡与对局结束可能不在同一 tick（服务器卡顿时尤其明显），
+     * 而**死亡界面里的玩家 {@code teleport()} 会失败** —— 只试一次就会出现
+     * 「别人回主城了，他还卡在原地，谁都交互不了」。每次尝试都先 respawn() 再传送。
+     */
+    private void schedulePostGameTeleports() {
+        if (!(getGameRoom() instanceof CeasefireRoom room) || !room.teleportToLobbyOnEnd) {
+            return;
+        }
+        CeasefireWar plugin = CeasefireWar.getInstance();
+        if (plugin == null) {
+            return;
+        }
+        // 先抓名单：cleanup 之后框架会 removeAllPlayer()，那时 getPlayers() 已经是空的
+        List<UUID> ids = getPlayers().stream().map(PlayerExt::getUniqueId).toList();
+        for (long delay : new long[]{1L, 5L, 20L}) {
+            Bukkit.getScheduler().runTaskLater(plugin, () -> sendAllToLobby(ids), delay);
+        }
+    }
+
+    /** 把名单里的在线玩家复活并传送到主大厅（支持跨维度）。 */
+    private void sendAllToLobby(List<UUID> ids) {
+        Location lobby = MCZJUGameCore.getLobbyManager().getMainLobby();
+        if (lobby == null || lobby.getWorld() == null) {
+            logger.error("[Ceasefire] 找不到主大厅（lobbies.json 缺少 main，或世界未加载）→ 玩家不会被传送");
+            return;
+        }
+        int moved = 0;
+        for (UUID id : ids) {
+            Player p = Bukkit.getPlayer(id);
+            if (p == null || !p.isOnline()) {
+                continue;
+            }
+            if (p.getHealth() <= 0.0D) {
+                p.spigot().respawn();   // 死亡界面里传送会失败，先复活
+            }
+            if (p.getGameMode() == GameMode.SPECTATOR) {
+                p.setGameMode(GameMode.ADVENTURE);
+            }
+            if (p.getWorld() == lobby.getWorld() && p.getLocation().distanceSquared(lobby) < 4.0D) {
+                continue;               // 已经到位
+            }
+            if (p.teleport(lobby)) {
+                moved++;
+            }
+        }
+        logger.info("[Ceasefire] 收尾传送：本次 %d 人 / 名单 %d 人".formatted(moved, ids.size()));
+    }
+
+    private void removeDroppedItems() {
+        if (!(getGameRoom() instanceof CeasefireRoom room) || !room.clearDroppedItemsOnEnd) {
+            return;
+        }
+        World world = gameWorld;
+        if (world == null) {
+            return;
+        }
+        // 该世界里已经有新对局时不清理，避免误删新对局的矿物 / 知识之书。
+        if (CeasefireGame.gameInWorld(world) != null) {
+            logger.info("[Ceasefire] 跳过掉落物清理：该世界已有新对局");
+            return;
+        }
+        Location center = room.borderCenter;
+        // 0 = 清理整个世界（默认，竞技场为独立维度时推荐）；>0 才按缩圈中心做距离过滤。
+        double radius = room.clearDroppedItemsRadius;
+        boolean useRadius = radius > 0.0D && center != null && center.getWorld() == world;
+        double radiusSq = radius * radius;
+
+        int removed = 0;
+        for (Item item : world.getEntitiesByClass(Item.class)) {
+            if (useRadius) {
+                Location loc = item.getLocation();
+                double dx = loc.getX() - center.getX();
+                double dz = loc.getZ() - center.getZ();
+                if (dx * dx + dz * dz > radiusSq) {
+                    continue; // 场外（可能是别的小游戏或大厅），不动
+                }
+            }
+            item.remove();
+            removed++;
+        }
+        if (removed >= 0) {
+            logger.info("已清除场地内 %d 个掉落物".formatted(removed));
+        }
     }
 }

@@ -21,6 +21,7 @@ import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.inventory.CraftItemEvent;
+import org.bukkit.event.inventory.PrepareItemCraftEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.inventory.ItemStack;
@@ -33,7 +34,10 @@ import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * 游戏玩法监听：知识之书解锁 + 合成校验 + 原版附魔 + 咬人斧（金斧）+ 末影珍珠。
+ * 游戏玩法监听：知识之书解锁 + 合成白名单校验 + 原版附魔 + 咬人斧（金斧）+ 末影珍珠。
+ *
+ * <p>合成采用**白名单制**：只有 {@link Profession} 配方池里的物品可以被合成，其余一律禁止。
+ * 由 {@link #onPrepareCraft}（清空合成栏结果，方案 B）与 {@link #onCraft}（兜底取消并提示，方案 A）共同保证。
  */
 public final class GamePlayListener implements Listener {
 
@@ -66,6 +70,28 @@ public final class GamePlayListener implements Listener {
         }
     }
 
+    /**
+     * 合成预览白名单（方案 B）：产物不在职业配方池中时，直接清空合成栏的结果，
+     * 玩家看不到产物、点不下去。{@link #onCraft} 的白名单作为兜底。
+     */
+    @EventHandler
+    public void onPrepareCraft(PrepareItemCraftEvent event) {
+        if (!(event.getView().getPlayer() instanceof Player player)) {
+            return;
+        }
+        AbstractGame game = new PlayerExt(player).getGame();
+        if (!(game instanceof CeasefireGame)) {
+            return; // 不在局内：不干预。
+        }
+        ItemStack result = event.getInventory().getResult();
+        if (result == null) {
+            return;
+        }
+        if (!Profession.isProfessionRecipe(result.getType())) {
+            event.getInventory().setResult(null);
+        }
+    }
+
     /** 合成校验 + 原版附魔 + 咬人斧 + 末影珍珠。 */
     @EventHandler
     public void onCraft(CraftItemEvent event) {
@@ -82,14 +108,21 @@ public final class GamePlayListener implements Listener {
         Material type = result.getType();
         Profession prof = arena.getProfession(ext);
 
-        // 配方校验
-        if (Profession.isProfessionRecipe(type) && !arena.hasRecipe(ext, type)) {
+        // 白名单（方案 A）：只有职业配方池里的物品允许合成，其余一律拒绝。
+        if (!Profession.isProfessionRecipe(type)) {
             event.setCancelled(true);
-            player.sendMessage(TextParser.parse("<red>你尚未解锁该配方</red>"));
+            ext.sender().error("<red>该物品不在可合成列表中");
             return;
         }
-        if (prof == null || !Profession.isProfessionRecipe(type)) {
-            return; // 非职业配方，不处理。
+        // 在配方池内，但尚未用知识之书解锁。
+        if (!arena.hasRecipe(ext, type)) {
+            event.setCancelled(true);
+            ext.sender().error("<red>你尚未解锁该配方");
+            return;
+        }
+        // 未选职业：正常流程到不了这里（没选职业就无法解锁任何配方）。
+        if (prof == null) {
+            return;
         }
 
         boolean madeBiteAxe = false;
